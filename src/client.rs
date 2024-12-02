@@ -42,29 +42,10 @@ impl Client {
             .finalize();
 
         let client = AsyncClient::new(create_opts).context("Failed to create MQTT AsyncClient")?;
-        let e2e_histogram = latency.subscribe.clone();
         let _state = Arc::clone(&state);
         client.set_message_callback(move |_client, message| {
             if let Some(message) = message {
                 _state.on_receive();
-                let payload = message.payload();
-                let mut cursor = Cursor::new(payload);
-                if cursor.remaining() > std::mem::size_of::<u128>() {
-                    match cursor.read_u128::<byteorder::LittleEndian>() {
-                        Ok(ts) => {
-                            let now = SystemTime::now()
-                                .duration_since(SystemTime::UNIX_EPOCH)
-                                .unwrap()
-                                .as_millis();
-                            if now >= ts {
-                                e2e_histogram.observe((now - ts) as f64);
-                            }
-                        }
-                        Err(e) => {
-                            error!("Failed to read timestamp from payload: {}", e);
-                        }
-                    }
-                }
                 trace!("Received message, topic={}", message.topic());
             }
         });
@@ -89,7 +70,7 @@ impl Client {
             .connect_timeout(Duration::from_secs(self.opts.connect_timeout))
             .keep_alive_interval(Duration::from_secs(self.opts.keep_alive_interval))
             .max_inflight(self.opts.max_inflight)
-            .automatic_reconnect(Duration::from_millis(100), Duration::from_secs(3))
+            .automatic_reconnect(Duration::from_millis(10), Duration::from_secs(3))
             .ssl_options(
                 mqtt::SslOptionsBuilder::new()
                     .verify(self.opts.verify)
@@ -108,7 +89,7 @@ impl Client {
             );
             connected_state.on_connected();
         });
-
+        
         let state_ = Arc::clone(&self.state);
         self.inner.set_connection_lost_callback(move |c| {
             debug!(

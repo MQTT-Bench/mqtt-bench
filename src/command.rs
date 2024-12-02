@@ -256,23 +256,11 @@ pub async fn subscribe(
                     break;
                 }
 
-                let mut warning_count = 0;
                 loop {
                     if client_state.stopped() {
                         break;
                     }
-
-                    if client.connected() {
-                        tokio::time::sleep(Duration::from_secs(1)).await;
-                        continue;
-                    }
-                    if warning_count % 100 == 0 {
-                        warn!(
-                            "Client[client-id={}] is disconnected, awaiting reconnect",
-                            client.client_id()
-                        );
-                    }
-                    warning_count += 1;
+                    tokio::time::sleep(Duration::from_secs(1)).await;
                 }
             });
     }
