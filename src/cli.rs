@@ -7,6 +7,33 @@ pub struct Cli {
     pub command: Option<Commands>,
 }
 
+#[derive(Debug, Clone, clap::ValueEnum)]
+pub enum TlsType {
+    None,
+    TLS,
+    MTLS,
+    BYOC,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct TlsConfig {
+    /// Mode of TLS
+    ///
+    /// - None for clear-text TCP
+    ///
+    /// - TLS when client uses plain TLS
+    ///
+    /// - mTLS when mutable-TLS and use the same key/cert for all clients
+    ///
+    /// - BYOC when mTLS and each client uses its own key/cert pair
+    #[arg(long, default_value_t = TlsType::None, value_enum)]
+    tls_type: TlsType,
+
+    /// Absolute path to the directory where CA.key, CA.cert and device certs are stored
+    #[arg(long)]
+    path: String,
+}
+
 #[derive(Debug, Clone, Args)]
 pub struct Common {
     #[arg(long)]
@@ -66,6 +93,9 @@ pub struct Common {
 
     #[arg(long, default_value_t = 1024)]
     pub max_inflight: i32,
+
+    #[command(flatten)]
+    tls_config: TlsConfig,
 }
 
 impl Common {
