@@ -31,7 +31,7 @@ pub async fn connect(
             }
             break;
         }
-        let client = match crate::client::Client::new(
+        let mut client = match crate::client::Client::new(
             common.clone(),
             common.client_id_of(id),
             statistics.latency.clone(),
@@ -50,25 +50,18 @@ pub async fn connect(
         let _ = tokio::task::Builder::new()
             .name(&client.client_id())
             .spawn(async move {
-                let _ = client.connect().await;
-                let mut warning_count = 0;
+                let _ = client
+                    .tls_connect()
+                    .await
+                    .context("Failed to connect to MQTT server");
+                let _ = client.mqtt_connect().await;
+
                 loop {
                     if client_state.stopped() {
                         break;
                     }
-
-                    if client.connected() {
-                        trace!("Client[client-id={}] ping...", client.client_id());
-                        tokio::time::sleep(Duration::from_secs(1)).await;
-                        continue;
-                    }
-                    if warning_count % 100 == 0 {
-                        warn!(
-                            "Client[client-id={}] is disconnected, awaiting reconnect",
-                            client.client_id()
-                        );
-                    }
-                    warning_count += 1;
+                    tokio::time::sleep(Duration::from_secs(client.keep_alive_interval())).await;
+                    let _ = client.mqtt_ping().await;
                 }
             });
     }
