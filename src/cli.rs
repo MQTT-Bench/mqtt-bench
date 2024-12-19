@@ -1,4 +1,11 @@
+use anyhow::Context;
 use clap::{Args, Parser, Subcommand};
+use log::{debug, info};
+use openssl::pkey::{PKey, Private};
+use openssl::x509::X509;
+
+const CA_KEY_NAME: &str = "CA.key";
+const CA_CERT_NAME: &str = "CA.crt";
 
 #[derive(Debug, Parser)]
 #[command(name = "mqtt-bench", author, version, about, long_about = None)]
@@ -7,7 +14,7 @@ pub struct Cli {
     pub command: Option<Commands>,
 }
 
-#[derive(Debug, Clone, clap::ValueEnum)]
+#[derive(Debug, Clone, clap::ValueEnum, PartialEq)]
 pub enum TlsType {
     None,
     TLS,
@@ -27,11 +34,84 @@ pub struct TlsConfig {
     ///
     /// - BYOC when mTLS and each client uses its own key/cert pair
     #[arg(long, default_value_t = TlsType::None, value_enum)]
-    tls_type: TlsType,
+    pub tls_type: TlsType,
 
     /// Absolute path to the directory where CA.key, CA.cert and device certs are stored
     #[arg(long)]
-    path: String,
+    pub tls_path: Option<String>,
+
+    #[clap(skip)]
+    pub ca_cert: Option<X509>,
+
+    #[clap(skip)]
+    pub ca_key: Option<PKey<Private>>,
+
+    #[clap(skip)]
+    pub trusted_ca_certs: Vec<X509>,
+}
+
+impl TlsConfig {
+    pub fn try_load_ca(&mut self) -> Result<(), anyhow::Error> {
+        match self.tls_type {
+            TlsType::None => {
+                debug!("TLS is disabled");
+                return Ok(());
+            }
+            TlsType::TLS => {
+                debug!("TLS");
+                return Ok(());
+            }
+            TlsType::MTLS => {
+                info!("mTLS");
+            }
+            TlsType::BYOC => {
+                info!("BYOC");
+            }
+        }
+        let path = self
+            .tls_path
+            .as_ref()
+            .ok_or(anyhow::anyhow!("TLS config path required"))?;
+
+        let entries = std::fs::read_dir(path).context("Failed to list directory {path}")?;
+
+        for entry in entries {
+            let entry = entry.context("Failed to visit directory entry")?;
+            let file_type = entry.file_type().context("Failed to acquire file type")?;
+            if !file_type.is_file() {
+                continue;
+            }
+
+            if let Some(file_name) = entry.file_name().to_str() {
+                if file_name == CA_KEY_NAME {
+                    let ca_key_path = entry.path();
+                    self.ca_key = Some(crate::cert::load_ca_pkey(&ca_key_path)?);
+                }
+
+                if file_name == CA_CERT_NAME {
+                    let ca_cert_path = entry.path();
+                    self.ca_cert = Some(crate::cert::load_ca_cert(&ca_cert_path)?);
+                }
+            }
+
+            if self.ca_cert.is_some() && self.ca_key.is_some() {
+                break;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Default for TlsConfig {
+    fn default() -> Self {
+        Self {
+            tls_type: TlsType::None,
+            tls_path: None,
+            ca_cert: None,
+            ca_key: None,
+            trusted_ca_certs: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Args)]
@@ -95,7 +175,7 @@ pub struct Common {
     pub max_inflight: i32,
 
     #[command(flatten)]
-    tls_config: TlsConfig,
+    pub tls_config: TlsConfig,
 }
 
 impl Common {

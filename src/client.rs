@@ -1,4 +1,4 @@
-use super::cli::Common;
+use super::cli::{Common, TlsType};
 use crate::state::State;
 use crate::statistics::LatencyHistogram;
 use crate::subscription::Subscription;
@@ -11,7 +11,10 @@ use paho_mqtt as mqtt;
 use std::io::Cursor;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime};
+use openssl::pkey::{PKey, Private};
+use openssl::x509::X509;
 use tokio::time::Instant;
+use crate::cert;
 
 pub struct Client {
     opts: Common,
@@ -19,6 +22,8 @@ pub struct Client {
     pub inner: AsyncClient,
     latency: LatencyHistogram,
     state: Arc<State>,
+    key: Option<PKey<Private>>,
+    cert: Option<X509>,
 }
 
 impl Client {
@@ -35,7 +40,7 @@ impl Client {
         };
 
         let create_opts = mqtt::CreateOptionsBuilder::new_v3()
-            .client_id(client_id)
+            .client_id(&client_id)
             .server_uri(server_uri)
             .mqtt_version(mqtt::MQTT_VERSION_3_1_1)
             .persistence(mqtt::PersistenceType::None)
@@ -70,13 +75,26 @@ impl Client {
                 trace!("Received message, topic={}", message.topic());
             }
         });
-
+        
+        let mut key = None;
+        let mut cert = None;
+        
+        if opts.tls_config.tls_type == TlsType::MTLS || TlsType::BYOC == opts.tls_config.tls_type {
+            if let Some((ca_key, ca_cert)) = opts.tls_config.ca_key.as_ref().zip(opts.tls_config.ca_cert.as_ref()) {
+                let (dev_cert, dev_key) = cert::mk_ca_signed_cert(ca_cert, ca_key, &client_id)?;
+                key = Some(dev_key);
+                cert = Some(dev_cert);
+            }
+        }
+        
         Ok(Self {
             opts,
             subscription: OnceLock::new(),
             inner: client,
             latency,
             state,
+            key,
+            cert,
         })
     }
 
