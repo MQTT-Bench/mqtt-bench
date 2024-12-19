@@ -1,4 +1,5 @@
 use super::cli::{Common, TlsType};
+use crate::cert;
 use crate::state::State;
 use crate::statistics::LatencyHistogram;
 use crate::subscription::Subscription;
@@ -7,14 +8,17 @@ use byteorder::ReadBytesExt;
 use bytes::Buf;
 use log::{debug, error, trace};
 use mqtt::AsyncClient;
+use openssl::pkey::{PKey, Private};
+use openssl::ssl::{Ssl, SslContext, SslMethod, SslVerifyMode};
+use openssl::x509::X509;
 use paho_mqtt as mqtt;
 use std::io::Cursor;
+use std::pin::{pin, Pin};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime};
-use openssl::pkey::{PKey, Private};
-use openssl::x509::X509;
+use tokio::net::TcpStream;
 use tokio::time::Instant;
-use crate::cert;
+use tokio_openssl::SslStream;
 
 pub struct Client {
     opts: Common,
@@ -24,6 +28,7 @@ pub struct Client {
     state: Arc<State>,
     key: Option<PKey<Private>>,
     cert: Option<X509>,
+    stream: Option<SslStream<TcpStream>>,
 }
 
 impl Client {
@@ -75,18 +80,23 @@ impl Client {
                 trace!("Received message, topic={}", message.topic());
             }
         });
-        
+
         let mut key = None;
         let mut cert = None;
-        
+
         if opts.tls_config.tls_type == TlsType::MTLS || TlsType::BYOC == opts.tls_config.tls_type {
-            if let Some((ca_key, ca_cert)) = opts.tls_config.ca_key.as_ref().zip(opts.tls_config.ca_cert.as_ref()) {
+            if let Some((ca_key, ca_cert)) = opts
+                .tls_config
+                .ca_key
+                .as_ref()
+                .zip(opts.tls_config.ca_cert.as_ref())
+            {
                 let (dev_cert, dev_key) = cert::mk_ca_signed_cert(ca_cert, ca_key, &client_id)?;
                 key = Some(dev_key);
                 cert = Some(dev_cert);
             }
         }
-        
+
         Ok(Self {
             opts,
             subscription: OnceLock::new(),
@@ -95,11 +105,39 @@ impl Client {
             state,
             key,
             cert,
+            stream: None,
         })
     }
 
     pub fn client_id(&self) -> String {
         self.inner.client_id()
+    }
+
+    pub async fn tls_connect(&mut self) -> Result<(), anyhow::Error> {
+        let addr = format!("{}:{}", self.opts.host, self.opts.port.unwrap_or(8883));
+        let mut tcp_stream = TcpStream::connect(&addr).await?;
+        let mut ssl_context_builder = SslContext::builder(SslMethod::tls_client())?;
+        if let Some((cert, key)) = self.cert.as_ref().zip(self.key.as_ref()) {
+            ssl_context_builder.set_certificate(cert)?;
+            ssl_context_builder.set_private_key(&key)?;
+        }
+        ssl_context_builder.set_verify(SslVerifyMode::NONE);
+        let ssl_context = ssl_context_builder.build();
+        let ssl = Ssl::new(&ssl_context)?;
+        let mut ssl_stream = SslStream::new(ssl, tcp_stream)?;
+        let pin_ssl_stream = Pin::new(&mut ssl_stream);
+        pin_ssl_stream.connect().await?;
+        self.stream = Some(ssl_stream);
+        Ok(())
+    }
+
+    pub async fn mqtt_connect(&mut self) -> Result<(), anyhow::Error> {
+        
+        Ok(())
+    }
+
+    pub async fn mqtt_ping(&mut self) -> Result<(), anyhow::Error> {
+        Ok(())
     }
 
     pub async fn connect(&self) -> Result<(), anyhow::Error> {
