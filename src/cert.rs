@@ -1,4 +1,5 @@
 use anyhow::{Context, Error};
+use log::{debug, info};
 use openssl::asn1::Asn1Time;
 use openssl::bn::{BigNum, MsbOption};
 use openssl::error::ErrorStack;
@@ -13,6 +14,11 @@ use openssl::x509::extension::{
 use openssl::x509::{X509NameBuilder, X509Ref, X509Req, X509ReqBuilder, X509};
 use std::path::Path;
 use std::{fs, fs::File, io::Read};
+
+use crate::cli::{TlsConfig, TlsType};
+
+const CA_KEY_NAME: &str = "CA.key";
+const CA_CERT_NAME: &str = "CA.crt";
 
 fn read_pem(path: &Path) -> Result<Vec<u8>, Error> {
     let mut f = File::open(path).context("Failed to read CA key file")?;
@@ -158,6 +164,59 @@ pub fn mk_ca_signed_cert(
     let cert = cert_builder.build();
 
     Ok((cert, key_pair))
+}
+
+pub fn parse_ca(config: &TlsConfig) -> Result<Option<(PKey<Private>, X509)>, anyhow::Error> {
+    match config.tls_type {
+        TlsType::None => {
+            debug!("TLS is disabled");
+            return Ok(None);
+        }
+        TlsType::TLS => {
+            debug!("TLS");
+            return Ok(None);
+        }
+        TlsType::MTLS => {
+            info!("mTLS");
+        }
+        TlsType::BYOC => {
+            info!("BYOC");
+        }
+    }
+    let path = config
+        .tls_path
+        .as_ref()
+        .ok_or(anyhow::anyhow!("TLS config path required"))?;
+
+    let entries = std::fs::read_dir(path).context("Failed to list directory {path}")?;
+
+    let mut ca_key = None;
+    let mut ca_cert = None;
+
+    for entry in entries {
+        let entry = entry.context("Failed to visit directory entry")?;
+        let file_type = entry.file_type().context("Failed to acquire file type")?;
+        if !file_type.is_file() {
+            continue;
+        }
+
+        if let Some(file_name) = entry.file_name().to_str() {
+            if file_name == CA_KEY_NAME {
+                let ca_key_path = entry.path();
+                ca_key = Some(load_ca_pkey(&ca_key_path)?);
+            }
+
+            if file_name == CA_CERT_NAME {
+                let ca_cert_path = entry.path();
+                ca_cert = Some(load_ca_cert(&ca_cert_path)?);
+            }
+        }
+
+        if ca_cert.is_some() && ca_key.is_some() {
+            break;
+        }
+    }
+    Ok(ca_key.zip(ca_cert))
 }
 
 #[cfg(test)]

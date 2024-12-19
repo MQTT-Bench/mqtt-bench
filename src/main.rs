@@ -35,16 +35,18 @@ async fn main() -> Result<(), anyhow::Error> {
     let state;
     match cli.command {
         Some(cmd) => match cmd {
-            Commands::Connect { common } => {
+            Commands::Connect { mut common } => {
+                common.tls_config.try_load_ca()?;
                 state = State::new(common.total);
                 watch_state(Arc::clone(&state), rx);
                 connect(&common, &state, &statistics).await?;
             }
 
             Commands::Pub {
-                common,
+                mut common,
                 mut pub_options,
             } => {
+                common.tls_config.try_load_ca()?;
                 state = State::new(common.total);
                 watch_state(Arc::clone(&state), rx);
                 if 0 == pub_options.topic_total {
@@ -59,9 +61,10 @@ async fn main() -> Result<(), anyhow::Error> {
             }
 
             Commands::Sub {
-                common,
+                mut common,
                 mut sub_options,
             } => {
+                common.tls_config.try_load_ca()?;
                 state = State::new(common.total);
                 watch_state(Arc::clone(&state), rx);
                 if 0 == sub_options.topic_total {
@@ -76,9 +79,10 @@ async fn main() -> Result<(), anyhow::Error> {
             }
 
             Commands::Benchmark {
-                common,
+                mut common,
                 mut pub_options,
             } => {
+                common.tls_config.try_load_ca()?;
                 state = State::new(common.total);
                 watch_state(Arc::clone(&state), rx);
                 if 0 == pub_options.topic_total {
