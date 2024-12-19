@@ -50,19 +50,18 @@ pub async fn connect(
         let _ = tokio::task::Builder::new()
             .name(&client.client_id())
             .spawn(async move {
-                let ssl_stream = client
+                let _ = client
                     .tls_connect()
                     .await
-                    .context("Failed to connect to MQTT server").unwrap();
-                
-                client.mqtt_connect().await.unwrap();
-                
+                    .context("Failed to connect to MQTT server");
+                let _ = client.mqtt_connect().await;
+
                 loop {
                     if client_state.stopped() {
                         break;
                     }
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                    client.mqtt_ping().await.unwrap();
+                    tokio::time::sleep(Duration::from_secs(client.keep_alive_interval())).await;
+                    let _ = client.mqtt_ping().await;
                 }
             });
     }

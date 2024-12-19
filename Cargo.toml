@@ -22,6 +22,7 @@ openssl = "0.10"
 paho-mqtt = { version = "0.12", features = ["vendored-ssl"] }
 prometheus = "0.13.4"
 ratelimit = "0.10.0"
+rumqttc = { version = "0.24" , default-features = false }
 tokio = { version = "1", features = ["full"] }
 tokio-openssl = "0.6.5"
 

@@ -5,23 +5,28 @@ use crate::statistics::LatencyHistogram;
 use crate::subscription::Subscription;
 use anyhow::Context;
 use byteorder::ReadBytesExt;
-use bytes::Buf;
-use log::{debug, error, trace};
+use bytes::{Buf, BufMut, BytesMut};
+use log::{debug, error, info, trace, warn};
 use mqtt::AsyncClient;
 use openssl::pkey::{PKey, Private};
 use openssl::ssl::{Ssl, SslContext, SslMethod, SslVerifyMode};
 use openssl::x509::X509;
 use paho_mqtt as mqtt;
+use rumqttc::{check, Connect, Error, PacketType, PingReq, Protocol};
 use std::io::Cursor;
-use std::pin::{pin, Pin};
+use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::Instant;
 use tokio_openssl::SslStream;
 
+const MAX_PACKET_SIZE: usize = 1024 * 64;
+
 pub struct Client {
     opts: Common,
+    client_id: String,
     subscription: OnceLock<Subscription>,
     pub inner: AsyncClient,
     latency: LatencyHistogram,
@@ -29,6 +34,7 @@ pub struct Client {
     key: Option<PKey<Private>>,
     cert: Option<X509>,
     stream: Option<SslStream<TcpStream>>,
+    buffer: BytesMut,
 }
 
 impl Client {
@@ -62,7 +68,7 @@ impl Client {
                 let payload = message.payload();
                 let mut cursor = Cursor::new(payload);
                 if cursor.remaining() > std::mem::size_of::<u128>() {
-                    match cursor.read_u128::<byteorder::LittleEndian>() {
+                    match ReadBytesExt::read_u128::<byteorder::LittleEndian>(&mut cursor) {
                         Ok(ts) => {
                             let now = SystemTime::now()
                                 .duration_since(SystemTime::UNIX_EPOCH)
@@ -99,6 +105,7 @@ impl Client {
 
         Ok(Self {
             opts,
+            client_id,
             subscription: OnceLock::new(),
             inner: client,
             latency,
@@ -106,11 +113,16 @@ impl Client {
             key,
             cert,
             stream: None,
+            buffer: BytesMut::new(),
         })
     }
 
     pub fn client_id(&self) -> String {
         self.inner.client_id()
+    }
+
+    pub fn keep_alive_interval(&self) -> u64 {
+        self.opts.keep_alive_interval
     }
 
     pub async fn tls_connect(&mut self) -> Result<(), anyhow::Error> {
@@ -132,11 +144,95 @@ impl Client {
     }
 
     pub async fn mqtt_connect(&mut self) -> Result<(), anyhow::Error> {
-        
+        if let Some(ssl_stream) = self.stream.as_mut() {
+            let mut connect = Connect::new(&self.client_id);
+            connect.protocol = Protocol::V4;
+            connect.set_login(&self.opts.username, &self.opts.password);
+            let mut buf = BytesMut::new();
+            connect
+                .write(&mut buf)
+                .context("Failed to serialize CONNECT packet")?;
+            ssl_stream.write_all(&buf).await?;
+            ssl_stream.flush().await?;
+            info!("{} Connect packet sent", self.client_id);
+            let mut buf = [0u8; 16];
+            loop {
+                let limit = AsyncReadExt::read(ssl_stream, &mut buf).await?;
+                if 0 == limit {
+                    warn!("{} Reached EOF while awaiting ConnAck", self.client_id);
+                    break;
+                }
+                trace!("{} Read {limit} bytes from network", self.client_id);
+                self.buffer.put_slice(&buf[..limit]);
+
+                match check(self.buffer.iter(), MAX_PACKET_SIZE) {
+                    Ok(fixed_header) => {
+                        let packet_buf = self.buffer.split_to(fixed_header.frame_length()).freeze();
+                        match fixed_header.packet_type() {
+                            Ok(PacketType::ConnAck) => {
+                                info!("{} ConnAck packet received", self.client_id);
+                                break;
+                            }
+                            _ => {
+                                continue;
+                            }
+                        }
+                    }
+                    Err(Error::PayloadSizeLimitExceeded(_n)) => {
+                        break;
+                    }
+                    Err(Error::InsufficientBytes(_n)) => {}
+                    Err(e) => {
+                        break;
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
     pub async fn mqtt_ping(&mut self) -> Result<(), anyhow::Error> {
+        if let Some(ssl_stream) = self.stream.as_mut() {
+            let mut buf = BytesMut::new();
+            PingReq
+                .write(&mut buf)
+                .context("Failed to serialize CONNECT packet")?;
+            ssl_stream.write_all(&buf).await?;
+            ssl_stream.flush().await?;
+            trace!("{} PingReq sent", self.client_id);
+            let mut buf = [0u8; 16];
+            loop {
+                let limit = AsyncReadExt::read(ssl_stream, &mut buf).await?;
+                if limit == 0 {
+                    warn!("{} Reached EOF while awaiting PingResp", self.client_id);
+                    break;
+                }
+
+                trace!("{} Read {limit} bytes from network", self.client_id);
+                self.buffer.put_slice(&buf[..limit]);
+                match check(self.buffer.iter(), MAX_PACKET_SIZE) {
+                    Ok(fixed_header) => {
+                        let packet_buf = self.buffer.split_to(fixed_header.frame_length()).freeze();
+                        match fixed_header.packet_type() {
+                            Ok(PacketType::PingResp) => {
+                                trace!("{} PingResp packet received", self.client_id);
+                                break;
+                            }
+                            _ => {
+                                continue;
+                            }
+                        }
+                    }
+                    Err(Error::PayloadSizeLimitExceeded(_n)) => {
+                        break;
+                    }
+                    Err(Error::InsufficientBytes(_n)) => {}
+                    Err(e) => {
+                        break;
+                    }
+                }
+            }
+        }
         Ok(())
     }
 

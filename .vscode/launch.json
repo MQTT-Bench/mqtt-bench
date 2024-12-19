@@ -24,11 +24,12 @@
             },
             "args": [
                 "connect",
-                "--host",
-                "mqtt-8x92m33r-gz-public.mqtt.tencenttdmq.com",
-                "--ssl",
-                "-u","root",
-                "--password", "password",
+                "--host", "localhost",
+                "--port", "8883",
+                "--username","user0",
+                "--password", "secret0",
+                "--tls-type", "byoc",
+                "--tls-path", "/Users/lizhanhui/repo/mqtt-bench/assets"
             ],
             "cwd": "${workspaceFolder}"
         },
