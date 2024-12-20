@@ -20,7 +20,7 @@
                 }
             },
             "env": {
-                "RUST_LOG": "debug"
+                "RUST_LOG": "info"
             },
             "args": [
                 "connect",
@@ -29,7 +29,9 @@
                 "--username","user0",
                 "--password", "secret0",
                 "--tls-type", "byoc",
-                "--tls-path", "/Users/lizhanhui/repo/mqtt-bench/assets"
+                "--tls-path", "/Users/lizhanhui/repo/mqtt-bench/assets",
+                "--time", "10",
+                "--total", "1024"
             ],
             "cwd": "${workspaceFolder}"
         },

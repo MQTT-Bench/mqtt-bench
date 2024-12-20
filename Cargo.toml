@@ -18,6 +18,7 @@ clap-help = "1.2.0"
 console-subscriber = "0.2.0"
 env_logger = "0.11"
 log = "0.4"
+minstant = "0.1.7"
 openssl = "0.10"
 paho-mqtt = { version = "0.12", features = ["vendored-ssl"] }
 prometheus = "0.13.4"
