@@ -20,7 +20,7 @@ impl Statistics {
     pub fn new() -> Self {
         let r = Registry::new();
         let conn_histogram_opts = HistogramOpts::new("conn_histogram", "Connect Latency Histogram")
-            .buckets(linear_buckets(0.0, 100.0, 10).unwrap())
+            .buckets(linear_buckets(0.0, 1.0, 100).unwrap())
             .const_labels(labels! {"type".to_string() => "connect".to_string(), "unit".to_string() => "ms".to_string()});
         let connect = Histogram::with_opts(conn_histogram_opts).unwrap();
         r.register(Box::new(connect.clone())).unwrap();

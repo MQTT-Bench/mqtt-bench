@@ -6,7 +6,7 @@ use crate::subscription::Subscription;
 use anyhow::Context;
 use byteorder::ReadBytesExt;
 use bytes::{Buf, BufMut, BytesMut};
-use log::{debug, error, info, trace, warn};
+use log::{debug, error, trace, warn};
 use mqtt::AsyncClient;
 use openssl::pkey::{PKey, Private};
 use openssl::ssl::{Ssl, SslContext, SslMethod, SslVerifyMode};
@@ -127,7 +127,6 @@ impl Client {
 
     pub async fn tls_connect(&mut self) -> Result<(), anyhow::Error> {
         let addr = format!("{}:{}", self.opts.host, self.opts.port.unwrap_or(8883));
-        let mut tcp_stream = TcpStream::connect(&addr).await?;
         let mut ssl_context_builder = SslContext::builder(SslMethod::tls_client())?;
         if let Some((cert, key)) = self.cert.as_ref().zip(self.key.as_ref()) {
             ssl_context_builder.set_certificate(cert)?;
@@ -136,9 +135,14 @@ impl Client {
         ssl_context_builder.set_verify(SslVerifyMode::NONE);
         let ssl_context = ssl_context_builder.build();
         let ssl = Ssl::new(&ssl_context)?;
+
+        let start = minstant::Instant::now();
+        let tcp_stream = TcpStream::connect(&addr).await?;
         let mut ssl_stream = SslStream::new(ssl, tcp_stream)?;
         let pin_ssl_stream = Pin::new(&mut ssl_stream);
         pin_ssl_stream.connect().await?;
+        let elapsed = start.elapsed().as_millis() as f64;
+        self.latency.connect.observe(elapsed);
         self.stream = Some(ssl_stream);
         Ok(())
     }
@@ -154,7 +158,7 @@ impl Client {
                 .context("Failed to serialize CONNECT packet")?;
             ssl_stream.write_all(&buf).await?;
             ssl_stream.flush().await?;
-            info!("{} Connect packet sent", self.client_id);
+            debug!("{} Connect packet sent", self.client_id);
             let mut buf = [0u8; 16];
             loop {
                 let limit = AsyncReadExt::read(ssl_stream, &mut buf).await?;
@@ -167,10 +171,12 @@ impl Client {
 
                 match check(self.buffer.iter(), MAX_PACKET_SIZE) {
                     Ok(fixed_header) => {
-                        let packet_buf = self.buffer.split_to(fixed_header.frame_length()).freeze();
+                        let _packet_buf =
+                            self.buffer.split_to(fixed_header.frame_length()).freeze();
                         match fixed_header.packet_type() {
                             Ok(PacketType::ConnAck) => {
-                                info!("{} ConnAck packet received", self.client_id);
+                                debug!("{} ConnAck packet received", self.client_id);
+                                self.state.on_connected();
                                 break;
                             }
                             _ => {
@@ -182,7 +188,7 @@ impl Client {
                         break;
                     }
                     Err(Error::InsufficientBytes(_n)) => {}
-                    Err(e) => {
+                    Err(_e) => {
                         break;
                     }
                 }
@@ -212,7 +218,8 @@ impl Client {
                 self.buffer.put_slice(&buf[..limit]);
                 match check(self.buffer.iter(), MAX_PACKET_SIZE) {
                     Ok(fixed_header) => {
-                        let packet_buf = self.buffer.split_to(fixed_header.frame_length()).freeze();
+                        let _packet_buf =
+                            self.buffer.split_to(fixed_header.frame_length()).freeze();
                         match fixed_header.packet_type() {
                             Ok(PacketType::PingResp) => {
                                 trace!("{} PingResp packet received", self.client_id);
@@ -227,7 +234,7 @@ impl Client {
                         break;
                     }
                     Err(Error::InsufficientBytes(_n)) => {}
-                    Err(e) => {
+                    Err(_e) => {
                         break;
                     }
                 }

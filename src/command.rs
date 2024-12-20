@@ -3,7 +3,7 @@ use crate::state::State;
 use crate::statistics::Statistics;
 use anyhow::Context;
 use byteorder::WriteBytesExt;
-use log::{debug, error, info, trace, warn};
+use log::{debug, error, info, warn};
 use paho_mqtt::MessageBuilder;
 use ratelimit::Ratelimiter;
 use std::io::Cursor;
