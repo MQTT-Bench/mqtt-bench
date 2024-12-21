@@ -8,6 +8,7 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 use log::{debug, error, trace};
 use mqtt::AsyncClient;
 use openssl::ssl::{Ssl, SslContext, SslMethod, SslVerifyMode};
+use openssl::x509::store::X509StoreBuilder;
 use paho_mqtt as mqtt;
 use rumqttc::{
     check, Connect, ConnectReturnCode, Error, FixedHeader, PacketType, PingReq, Protocol,
@@ -93,6 +94,12 @@ impl Client<SslStream<TcpStream>> {
                 if let Some((cert, key)) = cert.as_ref().zip(key.as_ref()) {
                     ssl_context_builder.set_certificate(cert)?;
                     ssl_context_builder.set_private_key(key)?;
+                    let mut trust_store_builder = X509StoreBuilder::new()?;
+                    for cert in self.opts.tls_config.trusted_certs.iter() {
+                        trust_store_builder.add_cert(cert.to_owned())?;
+                        debug!("Add trusted cert: {:?}", cert.subject_name());
+                    }
+                    ssl_context_builder.set_verify_cert_store(trust_store_builder.build())?;
                 }
                 ssl_context_builder.set_verify(SslVerifyMode::PEER);
             }
