@@ -3,26 +3,28 @@ use crate::cert;
 use crate::state::State;
 use crate::statistics::LatencyHistogram;
 use crate::subscription::Subscription;
-use anyhow::Context;
+use anyhow::{anyhow, Context};
 use byteorder::ReadBytesExt;
-use bytes::{Buf, BufMut, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use log::{debug, error, trace, warn};
 use mqtt::AsyncClient;
 use openssl::pkey::{PKey, Private};
 use openssl::ssl::{Ssl, SslContext, SslMethod, SslVerifyMode};
 use openssl::x509::X509;
 use paho_mqtt as mqtt;
-use rumqttc::{check, Connect, Error, PacketType, PingReq, Protocol};
+use rumqttc::{check, Connect, Error, FixedHeader, PacketType, PingReq, Protocol};
 use std::io::Cursor;
 use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::Instant;
 use tokio_openssl::SslStream;
 
 const MAX_PACKET_SIZE: usize = 1024 * 64;
+const MQTT_DEFAULT_TLS_PORT: u16 = 8883;
+const MQTT_DEFAULT_PORT: u16 = 1883;
 
 pub struct Client {
     opts: Common,
@@ -33,7 +35,8 @@ pub struct Client {
     state: Arc<State>,
     key: Option<PKey<Private>>,
     cert: Option<X509>,
-    stream: Option<SslStream<TcpStream>>,
+    stream: Option<TcpStream>,
+    ssl_stream: Option<SslStream<TcpStream>>,
     buffer: BytesMut,
 }
 
@@ -113,6 +116,7 @@ impl Client {
             key,
             cert,
             stream: None,
+            ssl_stream: None,
             buffer: BytesMut::new(),
         })
     }
@@ -126,71 +130,110 @@ impl Client {
     }
 
     pub async fn tls_connect(&mut self) -> Result<(), anyhow::Error> {
-        let addr = format!("{}:{}", self.opts.host, self.opts.port.unwrap_or(8883));
+        let addr = if TlsType::None != self.opts.tls_config.tls_type {
+            format!(
+                "{}:{}",
+                self.opts.host,
+                self.opts.port.unwrap_or(MQTT_DEFAULT_TLS_PORT)
+            )
+        } else {
+            format!(
+                "{}:{}",
+                self.opts.host,
+                self.opts.port.unwrap_or(MQTT_DEFAULT_PORT)
+            )
+        };
+
         let mut ssl_context_builder = SslContext::builder(SslMethod::tls_client())?;
-        if let Some((cert, key)) = self.cert.as_ref().zip(self.key.as_ref()) {
-            ssl_context_builder.set_certificate(cert)?;
-            ssl_context_builder.set_private_key(&key)?;
+
+        match self.opts.tls_config.tls_type {
+            TlsType::TLS => {
+                ssl_context_builder.set_verify(SslVerifyMode::NONE);
+            }
+            TlsType::MTLS | TlsType::BYOC => {
+                if let Some((cert, key)) = self.cert.as_ref().zip(self.key.as_ref()) {
+                    ssl_context_builder.set_certificate(cert)?;
+                    ssl_context_builder.set_private_key(&key)?;
+                }
+                ssl_context_builder.set_verify(SslVerifyMode::PEER);
+            }
+            TlsType::None => {}
         }
-        ssl_context_builder.set_verify(SslVerifyMode::NONE);
+
         let ssl_context = ssl_context_builder.build();
         let ssl = Ssl::new(&ssl_context)?;
 
         let start = minstant::Instant::now();
         let tcp_stream = TcpStream::connect(&addr).await?;
-        let mut ssl_stream = SslStream::new(ssl, tcp_stream)?;
-        let pin_ssl_stream = Pin::new(&mut ssl_stream);
-        pin_ssl_stream.connect().await?;
+
+        if TlsType::None == self.opts.tls_config.tls_type {
+            self.stream = Some(tcp_stream);
+        } else {
+            let mut ssl_stream = SslStream::new(ssl, tcp_stream)?;
+            let pin_ssl_stream = Pin::new(&mut ssl_stream);
+            pin_ssl_stream.connect().await?;
+            self.ssl_stream = Some(ssl_stream);
+        }
         let elapsed = start.elapsed().as_millis() as f64;
         self.latency.connect.observe(elapsed);
-        self.stream = Some(ssl_stream);
         Ok(())
     }
 
-    pub async fn mqtt_connect(&mut self) -> Result<(), anyhow::Error> {
-        if let Some(ssl_stream) = self.stream.as_mut() {
-            let mut connect = Connect::new(&self.client_id);
-            connect.protocol = Protocol::V4;
-            connect.set_login(&self.opts.username, &self.opts.password);
-            let mut buf = BytesMut::new();
-            connect
-                .write(&mut buf)
-                .context("Failed to serialize CONNECT packet")?;
-            ssl_stream.write_all(&buf).await?;
-            ssl_stream.flush().await?;
-            debug!("{} Connect packet sent", self.client_id);
-            let mut buf = [0u8; 16];
-            loop {
-                let limit = AsyncReadExt::read(ssl_stream, &mut buf).await?;
-                if 0 == limit {
-                    warn!("{} Reached EOF while awaiting ConnAck", self.client_id);
-                    break;
-                }
-                trace!("{} Read {limit} bytes from network", self.client_id);
-                self.buffer.put_slice(&buf[..limit]);
+    async fn write<'a, S: AsyncWrite + Unpin>(
+        stream: &mut S,
+        src: &'a [u8],
+    ) -> Result<(), anyhow::Error> {
+        stream.write_all(src).await?;
+        stream.flush().await?;
+        Ok(())
+    }
 
-                match check(self.buffer.iter(), MAX_PACKET_SIZE) {
-                    Ok(fixed_header) => {
-                        let _packet_buf =
-                            self.buffer.split_to(fixed_header.frame_length()).freeze();
-                        match fixed_header.packet_type() {
-                            Ok(PacketType::ConnAck) => {
-                                debug!("{} ConnAck packet received", self.client_id);
-                                self.state.on_connected();
-                                break;
-                            }
-                            _ => {
-                                continue;
-                            }
-                        }
-                    }
-                    Err(Error::PayloadSizeLimitExceeded(_n)) => {
-                        break;
-                    }
-                    Err(Error::InsufficientBytes(_n)) => {}
-                    Err(_e) => {
-                        break;
-                    }
+    async fn read<'a, S>(stream: &mut S, buffer: &mut BytesMut, client_id: &str) -> Result<(FixedHeader, Bytes), anyhow::Error>
+    where
+        S: AsyncRead + Unpin,
+    {
+        let mut buf = [0u8; 16];
+        loop {
+            let limit = AsyncReadExt::read(stream, &mut buf).await?;
+            if 0 == limit {
+                return Err(anyhow::anyhow!("EOF"));
+            }
+            trace!("{client_id} Read {limit} bytes from network");
+            buffer.put_slice(&buf[..limit]);
+
+            match check(buffer.iter(), MAX_PACKET_SIZE) {
+                Ok(fixed_header) => {
+                    let _packet_buf = buffer.split_to(fixed_header.frame_length()).freeze();
+                    return Ok((fixed_header, _packet_buf));
+                }
+                Err(Error::PayloadSizeLimitExceeded(_n)) => {
+                    return Err(anyhow!(format!("PayloadSizeLimitExceeded: {}", _n)));
+                }
+                Err(Error::InsufficientBytes(_n)) => {}
+                Err(_e) => {
+                    return Err(_e.into());
+                }
+            }
+        }
+    }
+
+    pub async fn mqtt_connect(&mut self) -> Result<(), anyhow::Error> {
+        let mut connect = Connect::new(&self.client_id);
+        connect.protocol = Protocol::V4;
+        connect.set_login(&self.opts.username, &self.opts.password);
+        let mut buf = BytesMut::new();
+        connect
+            .write(&mut buf)
+            .context("Failed to serialize CONNECT packet")?;
+
+        if let Some(ssl_stream) = self.ssl_stream.as_mut() {
+            Self::write(ssl_stream, &buf).await?;
+            debug!("{} Connect packet sent", self.client_id);
+            loop {
+                let (fixed_header, _buf) = Self::read(ssl_stream, &mut self.buffer, &self.client_id).await?;
+                if fixed_header.packet_type()? == PacketType::ConnAck {
+                    trace!("{} ConnAck packet received", self.client_id);
+                    break;
                 }
             }
         }
@@ -198,45 +241,19 @@ impl Client {
     }
 
     pub async fn mqtt_ping(&mut self) -> Result<(), anyhow::Error> {
-        if let Some(ssl_stream) = self.stream.as_mut() {
+        if let Some(ssl_stream) = self.ssl_stream.as_mut() {
             let mut buf = BytesMut::new();
             PingReq
                 .write(&mut buf)
                 .context("Failed to serialize CONNECT packet")?;
-            ssl_stream.write_all(&buf).await?;
-            ssl_stream.flush().await?;
+            Self::write(ssl_stream, &buf).await?;
             trace!("{} PingReq sent", self.client_id);
-            let mut buf = [0u8; 16];
-            loop {
-                let limit = AsyncReadExt::read(ssl_stream, &mut buf).await?;
-                if limit == 0 {
-                    warn!("{} Reached EOF while awaiting PingResp", self.client_id);
-                    break;
-                }
 
-                trace!("{} Read {limit} bytes from network", self.client_id);
-                self.buffer.put_slice(&buf[..limit]);
-                match check(self.buffer.iter(), MAX_PACKET_SIZE) {
-                    Ok(fixed_header) => {
-                        let _packet_buf =
-                            self.buffer.split_to(fixed_header.frame_length()).freeze();
-                        match fixed_header.packet_type() {
-                            Ok(PacketType::PingResp) => {
-                                trace!("{} PingResp packet received", self.client_id);
-                                break;
-                            }
-                            _ => {
-                                continue;
-                            }
-                        }
-                    }
-                    Err(Error::PayloadSizeLimitExceeded(_n)) => {
-                        break;
-                    }
-                    Err(Error::InsufficientBytes(_n)) => {}
-                    Err(_e) => {
-                        break;
-                    }
+            loop {
+                let (fixed_header, _buf) = Self::read(ssl_stream, &mut self.buffer, &self.client_id).await?;
+                if PacketType::PingResp == fixed_header.packet_type()? {
+                    trace!("{} PingResp packet received", self.client_id);
+                    break;
                 }
             }
         }

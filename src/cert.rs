@@ -41,6 +41,12 @@ pub fn load_ca_cert(cert_path: &Path) -> Result<X509, Error> {
     Ok(cert)
 }
 
+pub fn load_cert_stack(cert_path: &Path) -> Result<Vec<X509>, Error> {
+    let buffer = read_pem(cert_path)?;
+    let stack = X509::stack_from_pem(&buffer).context("Failed to parse cert stack")?;
+    Ok(stack)
+}
+
 /// Make a CA certificate and private key
 pub fn mk_ca_cert() -> Result<(X509, PKey<Private>), ErrorStack> {
     let rsa = Rsa::generate(2048)?;
