@@ -179,6 +179,7 @@ where
         if let Some(stream) = self.stream.as_mut() {
             stream.write_all(src).await?;
             stream.flush().await?;
+            trace!("{} wrote {} bytes to server", &self.client_id, src.len());
             return Ok(true);
         }
         Err(anyhow!("Missing stream"))
@@ -192,7 +193,7 @@ where
                 if 0 == limit {
                     return Err(anyhow::anyhow!("EOF"));
                 }
-                trace!("{} Read {limit} bytes from network", &self.client_id);
+                trace!("{} read {limit} bytes from network", &self.client_id);
                 self.buffer.put_slice(&buf[..limit]);
 
                 match check(self.buffer.iter(), MAX_PACKET_SIZE) {
@@ -222,11 +223,11 @@ where
             .write(&mut buf)
             .context("Failed to serialize CONNECT packet")?;
         self.write(&buf).await?;
-        debug!("{} Connect packet sent", self.client_id);
+        debug!("{} sent Connect packet", self.client_id);
         loop {
             let (fixed_header, packet_buf) = self.read().await?;
             if fixed_header.packet_type()? == PacketType::ConnAck {
-                trace!("{} ConnAck packet received", self.client_id);
+                trace!("{} received ConnAck packet", self.client_id);
                 let conn_ack = rumqttc::ConnAck::read(fixed_header, packet_buf)?;
                 if ConnectReturnCode::Success == conn_ack.code {
                     self.state.on_connected();
@@ -235,6 +236,14 @@ where
                 return Err(anyhow!(format!("Failed to connect: {:?}", conn_ack.code)));
             }
         }
+    }
+
+    pub async fn mqtt_disconnect(&mut self) -> Result<(), anyhow::Error> {
+        let mut buf = BytesMut::new();
+        rumqttc::Disconnect.write(&mut buf)?;
+        debug!("{} attempts to disconnect", self.client_id);
+        self.write(&buf).await.context("Failed to disconnect")?;
+        Ok(())
     }
 
     pub async fn mqtt_ping(&mut self) -> Result<(), anyhow::Error> {
