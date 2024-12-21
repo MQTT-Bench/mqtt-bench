@@ -1,8 +1,7 @@
-use log::{debug, info};
+use log::info;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc::Receiver;
 use tokio::time::sleep;
 
 pub struct State {
@@ -118,15 +117,11 @@ pub fn ctrl_c(state: Arc<State>) {
         });
 }
 
-pub fn print_stats(state: Arc<State>, mut rx: Receiver<()>) {
+pub fn print_stats(state: Arc<State>) {
     let _ = tokio::task::Builder::new().name("stats_printer").spawn({
         async move {
             loop {
                 tokio::select! {
-                    _ = rx.recv() => {
-                        debug!("Received signal to stop");
-                        break;
-                    }
                     _ = sleep(Duration::from_secs(1)) => {
                         info!("Client Summary[Attempted:{}, Connected: {}, Disconnected: {}] Publish: [Success: {}, Failure: {}], Subscribed: {}", 
                             state.attempted(), state.connected(), state.disconnected(),
