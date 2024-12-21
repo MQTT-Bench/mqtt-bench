@@ -6,6 +6,7 @@ use openssl::x509::X509;
 
 const CA_KEY_NAME: &str = "CA.key";
 const CA_CERT_NAME: &str = "CA.crt";
+const TRUST_CERT_NAME: &str = "Trust.crt";
 
 #[derive(Debug, Parser)]
 #[command(name = "mqtt-bench", author, version, about, long_about = None)]
@@ -47,7 +48,7 @@ pub struct TlsConfig {
     pub ca_key: Option<PKey<Private>>,
 
     #[clap(skip)]
-    pub trusted_ca_certs: Vec<X509>,
+    pub trusted_certs: Vec<X509>,
 }
 
 impl TlsConfig {
@@ -92,9 +93,14 @@ impl TlsConfig {
                     let ca_cert_path = entry.path();
                     self.ca_cert = Some(crate::cert::load_ca_cert(&ca_cert_path)?);
                 }
+
+                if file_name == TRUST_CERT_NAME {
+                    let trust_cert_path = entry.path();
+                    self.trusted_certs = crate::cert::load_cert_stack(&trust_cert_path)?;
+                }
             }
 
-            if self.ca_cert.is_some() && self.ca_key.is_some() {
+            if self.ca_cert.is_some() && self.ca_key.is_some() && !self.trusted_certs.is_empty() {
                 break;
             }
         }
@@ -109,7 +115,7 @@ impl Default for TlsConfig {
             tls_path: None,
             ca_cert: None,
             ca_key: None,
-            trusted_ca_certs: Vec::new(),
+            trusted_certs: Vec::new(),
         }
     }
 }
