@@ -1,14 +1,13 @@
 use std::sync::Arc;
 
 use clap::Parser;
-use log::{info, trace};
+use log::info;
 
 use mqtt_bench::cli::{Cli, Commands};
 use mqtt_bench::state::{ctrl_c, print_stats, State};
 
 use mqtt_bench::command::{benchmark, connect, publish, subscribe};
 use mqtt_bench::statistics::Statistics;
-use tokio::sync::mpsc::{channel, Receiver};
 
 #[cfg(not(target_env = "msvc"))]
 use tikv_jemallocator::Jemalloc;
@@ -17,9 +16,9 @@ use tikv_jemallocator::Jemalloc;
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;
 
-fn watch_state(state: Arc<State>, rx: Receiver<()>) {
+fn watch_state(state: Arc<State>) {
     ctrl_c(Arc::clone(&state));
-    print_stats(state, rx);
+    print_stats(state);
 }
 
 #[tokio::main]
@@ -29,7 +28,6 @@ async fn main() -> Result<(), anyhow::Error> {
     console_subscriber::init();
 
     let cli = Cli::parse();
-    let (tx, rx) = channel::<()>(1);
     let statistics = Statistics::new();
 
     let state;
@@ -38,7 +36,7 @@ async fn main() -> Result<(), anyhow::Error> {
             Commands::Connect { mut common } => {
                 common.tls_config.try_load_ca()?;
                 state = State::new(common.total);
-                watch_state(Arc::clone(&state), rx);
+                watch_state(Arc::clone(&state));
                 connect(&common, &state, &statistics).await?;
             }
 
@@ -48,7 +46,7 @@ async fn main() -> Result<(), anyhow::Error> {
             } => {
                 common.tls_config.try_load_ca()?;
                 state = State::new(common.total);
-                watch_state(Arc::clone(&state), rx);
+                watch_state(Arc::clone(&state));
                 if 0 == pub_options.topic_total {
                     pub_options.topic_total = common.total;
                     info!(
@@ -66,7 +64,7 @@ async fn main() -> Result<(), anyhow::Error> {
             } => {
                 common.tls_config.try_load_ca()?;
                 state = State::new(common.total);
-                watch_state(Arc::clone(&state), rx);
+                watch_state(Arc::clone(&state));
                 if 0 == sub_options.topic_total {
                     sub_options.topic_total = common.total;
                     info!(
@@ -84,7 +82,7 @@ async fn main() -> Result<(), anyhow::Error> {
             } => {
                 common.tls_config.try_load_ca()?;
                 state = State::new(common.total);
-                watch_state(Arc::clone(&state), rx);
+                watch_state(Arc::clone(&state));
                 if 0 == pub_options.topic_total {
                     pub_options.topic_total = common.total;
                     info!(
@@ -100,11 +98,6 @@ async fn main() -> Result<(), anyhow::Error> {
         None => {
             println!("No command specified");
         }
-    }
-
-    // Attempt to signal task that is printing statistics.
-    if let Err(_e) = tx.send(()).await {
-        trace!("Should have received Ctrl-C signal");
     }
 
     Ok(())
