@@ -1,5 +1,4 @@
 use super::cli::{Common, TlsType};
-use crate::cert;
 use crate::state::State;
 use crate::statistics::LatencyHistogram;
 use crate::subscription::Subscription;
@@ -8,11 +7,11 @@ use byteorder::ReadBytesExt;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use log::{debug, error, trace};
 use mqtt::AsyncClient;
-use openssl::pkey::{PKey, Private};
 use openssl::ssl::{Ssl, SslContext, SslMethod, SslVerifyMode};
-use openssl::x509::X509;
 use paho_mqtt as mqtt;
-use rumqttc::{check, Connect, Error, FixedHeader, PacketType, PingReq, Protocol};
+use rumqttc::{
+    check, Connect, ConnectReturnCode, Error, FixedHeader, PacketType, PingReq, Protocol,
+};
 use std::io::Cursor;
 use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
@@ -23,27 +22,101 @@ use tokio::time::Instant;
 use tokio_openssl::SslStream;
 
 const MAX_PACKET_SIZE: usize = 1024 * 64;
-const MQTT_DEFAULT_TLS_PORT: u16 = 8883;
-const MQTT_DEFAULT_PORT: u16 = 1883;
+pub(crate) const MQTT_DEFAULT_TLS_PORT: u16 = 8883;
+pub(crate) const MQTT_DEFAULT_PORT: u16 = 1883;
 
-pub struct Client {
+pub struct Client<S> {
     opts: Common,
     client_id: String,
     subscription: OnceLock<Subscription>,
     pub inner: AsyncClient,
     latency: LatencyHistogram,
     state: Arc<State>,
-    key: Option<PKey<Private>>,
-    cert: Option<X509>,
-    stream: Option<TcpStream>,
-    ssl_stream: Option<SslStream<TcpStream>>,
+    stream: Option<S>,
     buffer: BytesMut,
 }
 
-impl Client {
+impl Client<TcpStream> {
+    pub async fn stream_connect(&mut self) -> Result<(), anyhow::Error> {
+        let addr = format!(
+            "{}:{}",
+            self.opts.host,
+            self.opts.port.unwrap_or(MQTT_DEFAULT_PORT)
+        );
+
+        let start = minstant::Instant::now();
+        debug!("Connecting to {}", addr);
+        let tcp_stream = TcpStream::connect(&addr)
+            .await
+            .context("Failed to connect")?;
+        debug!("Connected to {}", addr);
+        self.stream = Some(tcp_stream);
+        let elapsed = start.elapsed().as_millis() as f64;
+        self.latency.connect.observe(elapsed);
+        Ok(())
+    }
+}
+
+impl Client<SslStream<TcpStream>> {
+    pub async fn stream_connect(&mut self) -> Result<(), anyhow::Error> {
+        let addr = format!(
+            "{}:{}",
+            self.opts.host,
+            self.opts.port.unwrap_or(MQTT_DEFAULT_TLS_PORT)
+        );
+
+        let mut ssl_context_builder = SslContext::builder(SslMethod::tls_client())?;
+        let start = minstant::Instant::now();
+        let tcp_stream = TcpStream::connect(&addr).await?;
+        match self.opts.tls_config.tls_type {
+            TlsType::None => return Err(anyhow!("Unreachable")),
+
+            TlsType::TLS => {
+                ssl_context_builder.set_verify(SslVerifyMode::NONE);
+            }
+
+            TlsType::MTLS | TlsType::BYOC => {
+                let mut key = None;
+                let mut cert = None;
+                if let Some((ca_key, ca_cert)) = self
+                    .opts
+                    .tls_config
+                    .ca_key
+                    .as_ref()
+                    .zip(self.opts.tls_config.ca_cert.as_ref())
+                {
+                    let (dev_cert, dev_key) =
+                        crate::cert::mk_ca_signed_cert(ca_cert, ca_key, &self.client_id)?;
+                    key = Some(dev_key);
+                    cert = Some(dev_cert);
+                }
+                if let Some((cert, key)) = cert.as_ref().zip(key.as_ref()) {
+                    ssl_context_builder.set_certificate(cert)?;
+                    ssl_context_builder.set_private_key(key)?;
+                }
+                ssl_context_builder.set_verify(SslVerifyMode::PEER);
+            }
+        }
+        let ssl_context = ssl_context_builder.build();
+        let ssl = Ssl::new(&ssl_context)?;
+        let mut ssl_stream = SslStream::new(ssl, tcp_stream)?;
+        let pin_ssl_stream = Pin::new(&mut ssl_stream);
+        pin_ssl_stream.connect().await?;
+        let elapsed = start.elapsed().as_millis() as f64;
+        self.latency.connect.observe(elapsed);
+        self.stream = Some(ssl_stream);
+        Ok(())
+    }
+}
+
+impl<S> Client<S>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     pub fn new(
         opts: Common,
         client_id: String,
+        stream: Option<S>,
         latency: LatencyHistogram,
         state: Arc<State>,
     ) -> Result<Self, anyhow::Error> {
@@ -90,22 +163,6 @@ impl Client {
             }
         });
 
-        let mut key = None;
-        let mut cert = None;
-
-        if opts.tls_config.tls_type == TlsType::MTLS || TlsType::BYOC == opts.tls_config.tls_type {
-            if let Some((ca_key, ca_cert)) = opts
-                .tls_config
-                .ca_key
-                .as_ref()
-                .zip(opts.tls_config.ca_cert.as_ref())
-            {
-                let (dev_cert, dev_key) = cert::mk_ca_signed_cert(ca_cert, ca_key, &client_id)?;
-                key = Some(dev_key);
-                cert = Some(dev_cert);
-            }
-        }
-
         Ok(Self {
             opts,
             client_id,
@@ -113,112 +170,47 @@ impl Client {
             inner: client,
             latency,
             state,
-            key,
-            cert,
-            stream: None,
-            ssl_stream: None,
+            stream,
             buffer: BytesMut::new(),
         })
     }
 
-    pub fn client_id(&self) -> String {
-        self.inner.client_id()
-    }
-
-    pub fn keep_alive_interval(&self) -> u64 {
-        self.opts.keep_alive_interval
-    }
-
-    pub async fn tls_connect(&mut self) -> Result<(), anyhow::Error> {
-        let addr = if TlsType::None != self.opts.tls_config.tls_type {
-            format!(
-                "{}:{}",
-                self.opts.host,
-                self.opts.port.unwrap_or(MQTT_DEFAULT_TLS_PORT)
-            )
-        } else {
-            format!(
-                "{}:{}",
-                self.opts.host,
-                self.opts.port.unwrap_or(MQTT_DEFAULT_PORT)
-            )
-        };
-
-        let mut ssl_context_builder = SslContext::builder(SslMethod::tls_client())?;
-
-        match self.opts.tls_config.tls_type {
-            TlsType::TLS => {
-                ssl_context_builder.set_verify(SslVerifyMode::NONE);
-            }
-            TlsType::MTLS | TlsType::BYOC => {
-                if let Some((cert, key)) = self.cert.as_ref().zip(self.key.as_ref()) {
-                    ssl_context_builder.set_certificate(cert)?;
-                    ssl_context_builder.set_private_key(key)?;
-                }
-                ssl_context_builder.set_verify(SslVerifyMode::PEER);
-            }
-            TlsType::None => {}
+    async fn write(&mut self, src: &[u8]) -> Result<bool, anyhow::Error> {
+        if let Some(stream) = self.stream.as_mut() {
+            stream.write_all(src).await?;
+            stream.flush().await?;
+            return Ok(true);
         }
-
-        let ssl_context = ssl_context_builder.build();
-        let ssl = Ssl::new(&ssl_context)?;
-
-        let start = minstant::Instant::now();
-        let tcp_stream = TcpStream::connect(&addr).await?;
-
-        if TlsType::None == self.opts.tls_config.tls_type {
-            self.stream = Some(tcp_stream);
-        } else {
-            let mut ssl_stream = SslStream::new(ssl, tcp_stream)?;
-            let pin_ssl_stream = Pin::new(&mut ssl_stream);
-            pin_ssl_stream.connect().await?;
-            self.ssl_stream = Some(ssl_stream);
-        }
-        let elapsed = start.elapsed().as_millis() as f64;
-        self.latency.connect.observe(elapsed);
-        Ok(())
+        Err(anyhow!("Missing stream"))
     }
 
-    async fn write<S>(stream: &mut S, src: &[u8]) -> Result<(), anyhow::Error>
-    where
-        S: AsyncWrite + Unpin,
-    {
-        stream.write_all(src).await?;
-        stream.flush().await?;
-        Ok(())
-    }
-
-    async fn read<'a, S>(
-        stream: &mut S,
-        buffer: &mut BytesMut,
-        client_id: &str,
-    ) -> Result<(FixedHeader, Bytes), anyhow::Error>
-    where
-        S: AsyncRead + Unpin,
-    {
-        let mut buf = [0u8; 16];
-        loop {
-            let limit = AsyncReadExt::read(stream, &mut buf).await?;
-            if 0 == limit {
-                return Err(anyhow::anyhow!("EOF"));
-            }
-            trace!("{client_id} Read {limit} bytes from network");
-            buffer.put_slice(&buf[..limit]);
-
-            match check(buffer.iter(), MAX_PACKET_SIZE) {
-                Ok(fixed_header) => {
-                    let _packet_buf = buffer.split_to(fixed_header.frame_length()).freeze();
-                    return Ok((fixed_header, _packet_buf));
+    async fn read(&mut self) -> Result<(FixedHeader, Bytes), anyhow::Error> {
+        if let Some(stream) = self.stream.as_mut() {
+            let mut buf = [0u8; 16];
+            loop {
+                let limit = AsyncReadExt::read(stream, &mut buf).await?;
+                if 0 == limit {
+                    return Err(anyhow::anyhow!("EOF"));
                 }
-                Err(Error::PayloadSizeLimitExceeded(_n)) => {
-                    return Err(anyhow!(format!("PayloadSizeLimitExceeded: {}", _n)));
-                }
-                Err(Error::InsufficientBytes(_n)) => {}
-                Err(_e) => {
-                    return Err(_e.into());
+                trace!("{} Read {limit} bytes from network", &self.client_id);
+                self.buffer.put_slice(&buf[..limit]);
+
+                match check(self.buffer.iter(), MAX_PACKET_SIZE) {
+                    Ok(fixed_header) => {
+                        let packet_buf = self.buffer.split_to(fixed_header.frame_length()).freeze();
+                        return Ok((fixed_header, packet_buf));
+                    }
+                    Err(Error::PayloadSizeLimitExceeded(n)) => {
+                        return Err(anyhow!(format!("PayloadSizeLimitExceeded: {}", n)));
+                    }
+                    Err(Error::InsufficientBytes(_n)) => {}
+                    Err(e) => {
+                        return Err(e.into());
+                    }
                 }
             }
         }
+        Err(anyhow::anyhow!("Missing stream"))
     }
 
     pub async fn mqtt_connect(&mut self) -> Result<(), anyhow::Error> {
@@ -229,41 +221,51 @@ impl Client {
         connect
             .write(&mut buf)
             .context("Failed to serialize CONNECT packet")?;
-
-        if let Some(ssl_stream) = self.ssl_stream.as_mut() {
-            Self::write(ssl_stream, &buf).await?;
-            debug!("{} Connect packet sent", self.client_id);
-            loop {
-                let (fixed_header, _buf) =
-                    Self::read(ssl_stream, &mut self.buffer, &self.client_id).await?;
-                if fixed_header.packet_type()? == PacketType::ConnAck {
-                    trace!("{} ConnAck packet received", self.client_id);
-                    break;
+        self.write(&buf).await?;
+        debug!("{} Connect packet sent", self.client_id);
+        loop {
+            let (fixed_header, packet_buf) = self.read().await?;
+            if fixed_header.packet_type()? == PacketType::ConnAck {
+                trace!("{} ConnAck packet received", self.client_id);
+                let conn_ack = rumqttc::ConnAck::read(fixed_header, packet_buf)?;
+                if ConnectReturnCode::Success == conn_ack.code {
+                    self.state.on_connected();
+                    return Ok(());
                 }
+                return Err(anyhow!(format!("Failed to connect: {:?}", conn_ack.code)));
+            }
+        }
+    }
+
+    pub async fn mqtt_ping(&mut self) -> Result<(), anyhow::Error> {
+        let mut buf = BytesMut::new();
+        PingReq
+            .write(&mut buf)
+            .context("Failed to serialize CONNECT packet")?;
+
+        self.write(&buf).await?;
+        trace!("{} PingReq sent", self.client_id);
+        loop {
+            let (fixed_header, _buf) = self.read().await?;
+            if PacketType::PingResp == fixed_header.packet_type()? {
+                trace!("{} PingResp packet received", self.client_id);
+                break;
             }
         }
         Ok(())
     }
+}
 
-    pub async fn mqtt_ping(&mut self) -> Result<(), anyhow::Error> {
-        if let Some(ssl_stream) = self.ssl_stream.as_mut() {
-            let mut buf = BytesMut::new();
-            PingReq
-                .write(&mut buf)
-                .context("Failed to serialize CONNECT packet")?;
-            Self::write(ssl_stream, &buf).await?;
-            trace!("{} PingReq sent", self.client_id);
+impl<S> Client<S> {
+    pub fn client_id(&self) -> String {
+        self.inner.client_id()
+    }
 
-            loop {
-                let (fixed_header, _buf) =
-                    Self::read(ssl_stream, &mut self.buffer, &self.client_id).await?;
-                if PacketType::PingResp == fixed_header.packet_type()? {
-                    trace!("{} PingResp packet received", self.client_id);
-                    break;
-                }
-            }
-        }
-        Ok(())
+    pub fn keep_alive_interval(&self) -> u64 {
+        self.opts.keep_alive_interval
+    }
+    pub fn connected(&self) -> bool {
+        self.inner.is_connected()
     }
 
     pub async fn connect(&self) -> Result<(), anyhow::Error> {
@@ -324,10 +326,6 @@ impl Client {
         Ok(())
     }
 
-    pub fn connected(&self) -> bool {
-        self.inner.is_connected()
-    }
-
     pub async fn publish(&self, message: mqtt::Message) -> Result<(), anyhow::Error> {
         let topic = message.topic().to_owned();
         let instant = Instant::now();
@@ -355,7 +353,7 @@ impl Client {
     }
 }
 
-impl Drop for Client {
+impl<S> Drop for Client<S> {
     fn drop(&mut self) {
         if self.connected() {
             if let Err(e) = self.inner.disconnect(None).wait() {

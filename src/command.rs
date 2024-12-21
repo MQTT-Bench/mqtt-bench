@@ -1,6 +1,6 @@
-use crate::cli::{Common, PubOptions, SubOptions};
+use crate::cli::{Common, PubOptions, SubOptions, TlsType};
 use crate::state::State;
-use crate::statistics::Statistics;
+use crate::statistics::{Statistics};
 use anyhow::Context;
 use byteorder::WriteBytesExt;
 use log::{debug, error, info, warn};
@@ -10,6 +10,8 @@ use std::io::Cursor;
 use std::mem::size_of;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
+use tokio::net::TcpStream;
+use tokio_openssl::SslStream;
 
 pub async fn connect(
     common: &Common,
@@ -31,39 +33,78 @@ pub async fn connect(
             }
             break;
         }
-        let mut client = match crate::client::Client::new(
-            common.clone(),
-            common.client_id_of(id),
-            statistics.latency.clone(),
-            Arc::clone(state),
-        )
-        .context(format!("Failed to create MQTT client client_{}", id))
-        {
-            Ok(client) => client,
-            Err(e) => {
-                error!("{}", e.to_string());
-                break;
-            }
-        };
-
-        let client_state = Arc::clone(state);
-        let _ = tokio::task::Builder::new()
-            .name(&client.client_id())
-            .spawn(async move {
-                let _ = client
-                    .tls_connect()
-                    .await
-                    .context("Failed to connect to MQTT server");
-                let _ = client.mqtt_connect().await;
-
-                loop {
-                    if client_state.stopped() {
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_secs(client.keep_alive_interval())).await;
-                    let _ = client.mqtt_ping().await;
+        
+        if TlsType::None == common.tls_config.tls_type {
+            let mut client = match crate::client::Client::new(
+                common.clone(),
+                common.client_id_of(id),
+                None::<TcpStream>,
+                statistics.latency.clone(),
+                Arc::clone(state),
+            )
+            .context(format!("Failed to create MQTT client client_{}", id))
+            {
+                Ok(client) => client,
+                Err(e) => {
+                    error!("{}", e.to_string());
+                    break;
                 }
-            });
+            };
+
+            let client_state = Arc::clone(state);
+            let _ = tokio::task::Builder::new()
+                .name(&client.client_id())
+                .spawn(async move {
+                    let _ = client
+                        .stream_connect()
+                        .await
+                        .context("Failed to connect to MQTT server");
+                    let _ = client.mqtt_connect().await;
+
+                    loop {
+                        if client_state.stopped() {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_secs(client.keep_alive_interval())).await;
+                        let _ = client.mqtt_ping().await;
+                    }
+                });
+        } else {
+            let mut client = match crate::client::Client::new(
+                common.clone(),
+                common.client_id_of(id),
+                None::<SslStream<TcpStream>>,
+                statistics.latency.clone(),
+                Arc::clone(state),
+            )
+            .context(format!("Failed to create MQTT client client_{}", id))
+            {
+                Ok(client) => client,
+                Err(e) => {
+                    error!("{}", e.to_string());
+                    break;
+                }
+            };
+
+            let client_state = Arc::clone(state);
+            let _ = tokio::task::Builder::new()
+                .name(&client.client_id())
+                .spawn(async move {
+                    let _ = client
+                        .stream_connect()
+                        .await
+                        .context("Failed to connect to MQTT server");
+                    let _ = client.mqtt_connect().await;
+
+                    loop {
+                        if client_state.stopped() {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_secs(client.keep_alive_interval())).await;
+                        let _ = client.mqtt_ping().await;
+                    }
+                });
+        }
     }
 
     await_connection(common.total, state).await;
@@ -118,6 +159,7 @@ pub async fn publish(
         let client = match crate::client::Client::new(
             common.clone(),
             common.client_id_of(id),
+            None::<TcpStream>,
             statistics.latency.clone(),
             Arc::clone(state),
         )
@@ -217,6 +259,7 @@ pub async fn subscribe(
         let client = match crate::client::Client::new(
             common.clone(),
             common.client_id_of(id),
+            None::<TcpStream>,
             statistics.latency.clone(),
             Arc::clone(state),
         )
@@ -283,6 +326,7 @@ pub async fn benchmark(
         let client = match crate::client::Client::new(
             common.clone(),
             common.client_id_of(id),
+            None::<TcpStream>,
             statistics.latency.clone(),
             Arc::clone(state),
         )
