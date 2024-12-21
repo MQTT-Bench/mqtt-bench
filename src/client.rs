@@ -6,7 +6,7 @@ use crate::subscription::Subscription;
 use anyhow::{anyhow, Context};
 use byteorder::ReadBytesExt;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use log::{debug, error, trace, warn};
+use log::{debug, error, trace};
 use mqtt::AsyncClient;
 use openssl::pkey::{PKey, Private};
 use openssl::ssl::{Ssl, SslContext, SslMethod, SslVerifyMode};
@@ -70,7 +70,7 @@ impl Client {
                 _state.on_receive();
                 let payload = message.payload();
                 let mut cursor = Cursor::new(payload);
-                if cursor.remaining() > std::mem::size_of::<u128>() {
+                if cursor.remaining() > size_of::<u128>() {
                     match ReadBytesExt::read_u128::<byteorder::LittleEndian>(&mut cursor) {
                         Ok(ts) => {
                             let now = SystemTime::now()
@@ -153,7 +153,7 @@ impl Client {
             TlsType::MTLS | TlsType::BYOC => {
                 if let Some((cert, key)) = self.cert.as_ref().zip(self.key.as_ref()) {
                     ssl_context_builder.set_certificate(cert)?;
-                    ssl_context_builder.set_private_key(&key)?;
+                    ssl_context_builder.set_private_key(key)?;
                 }
                 ssl_context_builder.set_verify(SslVerifyMode::PEER);
             }
@@ -179,16 +179,20 @@ impl Client {
         Ok(())
     }
 
-    async fn write<'a, S: AsyncWrite + Unpin>(
-        stream: &mut S,
-        src: &'a [u8],
-    ) -> Result<(), anyhow::Error> {
+    async fn write<S>(stream: &mut S, src: &[u8]) -> Result<(), anyhow::Error>
+    where
+        S: AsyncWrite + Unpin,
+    {
         stream.write_all(src).await?;
         stream.flush().await?;
         Ok(())
     }
 
-    async fn read<'a, S>(stream: &mut S, buffer: &mut BytesMut, client_id: &str) -> Result<(FixedHeader, Bytes), anyhow::Error>
+    async fn read<'a, S>(
+        stream: &mut S,
+        buffer: &mut BytesMut,
+        client_id: &str,
+    ) -> Result<(FixedHeader, Bytes), anyhow::Error>
     where
         S: AsyncRead + Unpin,
     {
@@ -230,7 +234,8 @@ impl Client {
             Self::write(ssl_stream, &buf).await?;
             debug!("{} Connect packet sent", self.client_id);
             loop {
-                let (fixed_header, _buf) = Self::read(ssl_stream, &mut self.buffer, &self.client_id).await?;
+                let (fixed_header, _buf) =
+                    Self::read(ssl_stream, &mut self.buffer, &self.client_id).await?;
                 if fixed_header.packet_type()? == PacketType::ConnAck {
                     trace!("{} ConnAck packet received", self.client_id);
                     break;
@@ -250,7 +255,8 @@ impl Client {
             trace!("{} PingReq sent", self.client_id);
 
             loop {
-                let (fixed_header, _buf) = Self::read(ssl_stream, &mut self.buffer, &self.client_id).await?;
+                let (fixed_header, _buf) =
+                    Self::read(ssl_stream, &mut self.buffer, &self.client_id).await?;
                 if PacketType::PingResp == fixed_header.packet_type()? {
                     trace!("{} PingResp packet received", self.client_id);
                     break;
