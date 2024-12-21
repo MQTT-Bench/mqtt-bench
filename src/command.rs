@@ -8,6 +8,7 @@ use paho_mqtt::MessageBuilder;
 use ratelimit::Ratelimiter;
 use std::io::Cursor;
 use std::mem::size_of;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tokio::net::TcpStream;
@@ -21,9 +22,9 @@ pub async fn connect(
     let rate_limiter = Ratelimiter::builder(1, Duration::from_millis(common.interval))
         .max_tokens(common.concurrency as u64)
         .build()?;
-    
+
     let mut handles = vec![];
-    
+
     for id in common.start_number..common.total + common.start_number {
         if state.stopped() {
             break;
@@ -120,11 +121,11 @@ pub async fn connect(
     if common.show_statistics {
         statistics.show_statistics();
     }
-    
+
     for handle in handles {
         let _ = handle.await;
     }
-    
+
     Ok(())
 }
 
@@ -425,10 +426,11 @@ async fn await_running(common: &Common, state: &Arc<State>) {
             break;
         }
         if i % 10 == 0 {
-            debug!("Running {}s, {}s to go", i, common.time - i);
+            info!("Running {}s, {}s to go", i, common.time - i);
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
+    state.stop_flag().store(true, Ordering::Relaxed);
 }
 
 fn tag_timestamp(data: &mut [u8]) -> anyhow::Result<()> {
