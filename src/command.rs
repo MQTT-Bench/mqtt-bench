@@ -1,6 +1,6 @@
 use crate::cli::{Common, PubOptions, SubOptions, TlsType};
 use crate::state::State;
-use crate::statistics::{Statistics};
+use crate::statistics::Statistics;
 use anyhow::Context;
 use byteorder::WriteBytesExt;
 use log::{debug, error, info, warn};
@@ -21,6 +21,9 @@ pub async fn connect(
     let rate_limiter = Ratelimiter::builder(1, Duration::from_millis(common.interval))
         .max_tokens(common.concurrency as u64)
         .build()?;
+    
+    let mut handles = vec![];
+    
     for id in common.start_number..common.total + common.start_number {
         if state.stopped() {
             break;
@@ -33,7 +36,7 @@ pub async fn connect(
             }
             break;
         }
-        
+
         if TlsType::None == common.tls_config.tls_type {
             let mut client = match crate::client::Client::new(
                 common.clone(),
@@ -52,7 +55,7 @@ pub async fn connect(
             };
 
             let client_state = Arc::clone(state);
-            let _ = tokio::task::Builder::new()
+            let join_handle = tokio::task::Builder::new()
                 .name(&client.client_id())
                 .spawn(async move {
                     let _ = client
@@ -68,7 +71,9 @@ pub async fn connect(
                         tokio::time::sleep(Duration::from_secs(client.keep_alive_interval())).await;
                         let _ = client.mqtt_ping().await;
                     }
-                });
+                    let _ = client.mqtt_disconnect().await;
+                })?;
+            handles.push(join_handle);
         } else {
             let mut client = match crate::client::Client::new(
                 common.clone(),
@@ -87,7 +92,7 @@ pub async fn connect(
             };
 
             let client_state = Arc::clone(state);
-            let _ = tokio::task::Builder::new()
+            let join_handle = tokio::task::Builder::new()
                 .name(&client.client_id())
                 .spawn(async move {
                     let _ = client
@@ -103,7 +108,9 @@ pub async fn connect(
                         tokio::time::sleep(Duration::from_secs(client.keep_alive_interval())).await;
                         let _ = client.mqtt_ping().await;
                     }
-                });
+                    let _ = client.mqtt_disconnect().await;
+                })?;
+            handles.push(join_handle);
         }
     }
 
@@ -113,6 +120,11 @@ pub async fn connect(
     if common.show_statistics {
         statistics.show_statistics();
     }
+    
+    for handle in handles {
+        let _ = handle.await;
+    }
+    
     Ok(())
 }
 
